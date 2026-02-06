@@ -1,10 +1,7 @@
 import os
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image
 from flask import Flask, request, render_template, jsonify
 from werkzeug.utils import secure_filename
+from gradio_client import Client, handle_file
 
 # ── App Config ──
 app = Flask(__name__)
@@ -14,48 +11,23 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'webp'}
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# ── Class Names (must match training order) ──
-CLASS_NAMES = ['Pneumonia', 'Regular']
+# ── Hugging Face Space Config ──
+# Set this env var to your HF Space name, e.g. "your-username/pneumonia-detection"
+HF_SPACE = os.environ.get('HF_SPACE', '')
+hf_client = None
 
-# ── Image Transforms (same as training eval transforms) ──
-IMAGE_SIZE = 224
-MEAN = [0.485, 0.456, 0.406]
-STD  = [0.229, 0.224, 0.225]
 
-transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(MEAN, STD),
-])
-
-# ── Load Model ──
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def load_model(model_path):
-    """Rebuild the same ResNet18 architecture used during training and load weights."""
-    model = models.resnet18(weights=None)
-    in_features = model.fc.in_features
-    model.fc = nn.Sequential(
-        nn.Dropout(0.4),
-        nn.Linear(in_features, 256),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Linear(256, len(CLASS_NAMES)),
-    )
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    print(f"Model loaded from {model_path}  (epoch {checkpoint['epoch']}, "
-          f"val acc {checkpoint['val_acc']:.2f}%) on {device}")
-    return model
-
-# Path to the saved .pth file — same directory as app.py
-MODEL_PATH = os.environ.get(
-    'MODEL_PATH',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'best_pneumonia_model.pth')
-)
-model = load_model(MODEL_PATH)
+def get_hf_client():
+    """Lazy-initialize the Gradio client."""
+    global hf_client
+    if hf_client is None:
+        if not HF_SPACE:
+            raise RuntimeError(
+                "HF_SPACE environment variable is not set. "
+                "Set it to your Hugging Face Space name, e.g. 'username/pneumonia-detection'"
+            )
+        hf_client = Client(HF_SPACE)
+    return hf_client
 
 
 # ── Helper Functions ──
@@ -64,18 +36,11 @@ def allowed_file(filename):
 
 
 def predict(image_path):
-    """Run inference on a single image and return class name + confidence."""
-    img = Image.open(image_path).convert('RGB')
-    tensor = transform(img).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        logits = model(tensor)
-        probs = torch.softmax(logits, dim=1)
-        confidence, predicted = probs.max(1)
-
-    label = CLASS_NAMES[predicted.item()]
-    conf  = round(confidence.item() * 100, 2)
-    return label, conf
+    """Call the Hugging Face Space API for inference."""
+    client = get_hf_client()
+    result = client.predict(image=handle_file(image_path), api_name="/predict")
+    # result is a dict: {"label": "Pneumonia", "confidence": 95.23}
+    return result['label'], result['confidence']
 
 
 # ── Routes ──
